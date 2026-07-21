@@ -212,11 +212,16 @@ def is_noise_wim(share, full_path):
 
 
 def crawl_share_for_wim(share, host, username, password, domain, nthash,
-                        max_depth=25):
+                        max_depth=25, start_path=""):
     """
     Recursively walk a single share looking for .wim files. Opens its own
     SMB connection so it can run in its own worker thread independent of
     other share crawls.
+
+    start_path lets the walk begin at a subdirectory instead of the share
+    root (used by --search-path to target one known-good location instead
+    of crawling the whole share).
+
     Returns a list of (share, full_smb_path, size) tuples.
     """
     found = []
@@ -250,7 +255,7 @@ def crawl_share_for_wim(share, host, username, password, domain, nthash,
                       f"({size/1_048_576:.1f} MB)")
 
     try:
-        walk("", 0)
+        walk(start_path.rstrip("\\"), 0)
     finally:
         conn.logoff()
     return found
@@ -286,6 +291,20 @@ def search_host_for_wims(host, username, password, domain, nthash,
                 print(f"    [-] {share}: crawl failed ({e})")
 
     return all_found
+
+
+def search_path_for_wims(host, share, start_path, username, password, domain, nthash):
+    """
+    Crawl a single, caller-specified share (optionally starting at a subpath)
+    for .wim files, skipping share enumeration entirely. Used by --search-path
+    when the target share is already known and a full --search of every share
+    on the host would be slow or noisy.
+    """
+    where = f"\\\\{host}\\{share}" + (start_path if start_path else "")
+    print(f"[*] Crawling {where} for .wim files …")
+    found = crawl_share_for_wim(share, host, username, password, domain, nthash,
+                               start_path=start_path)
+    return found
 
 
 GREEN = "\033[32m"
@@ -656,6 +675,12 @@ def main():
     ap.add_argument("-s", "--search", metavar="HOST",
                     help="Crawl all readable shares on HOST for .wim files, "
                          "then prompt for one to download/extract")
+    ap.add_argument("--search-path", metavar="UNC",
+                    help=r"Crawl a single share (optionally starting at a "
+                         r"subpath) for .wim files, then prompt for one — "
+                         r"e.g. '\\192.168.1.10\deploy\images\2023'. Skips "
+                         r"share enumeration; use when --search finds too "
+                         r"many shares and you just want to target one.")
     ap.add_argument("--threads", type=int, default=8,
                     help="Parallel share-crawl workers for --search (default: 8)")
     ap.add_argument("--include-admin-shares", action="store_true",
@@ -679,8 +704,10 @@ def main():
     if "\\" in username:
         domain, username = username.split("\\", 1)
 
-    if not args.search and not args.wim_unc:
-        ap.error("wim_unc is required unless --search/-s is used")
+    if not args.search and not args.search_path and not args.wim_unc:
+        ap.error("wim_unc is required unless --search/-s or --search-path is used")
+    if args.search and args.search_path:
+        ap.error("--search and --search-path are mutually exclusive")
 
     out_dir = args.out or tempfile.mkdtemp(prefix="wim_dump_")
     os.makedirs(out_dir, exist_ok=True)
@@ -714,8 +741,40 @@ def main():
                            image_index=args.image_index,
                            out_dir=image_out_dir, wimlib=wimlib)
                 processed.add(selected_unc)
+        return
 
-    # ── single-file mode (no --search) ──
+    # ── search-path mode: crawl one caller-specified share, then prompt ──
+    if args.search_path:
+        raw = args.search_path.replace("smb://", "//").replace("\\", "/").lstrip("/")
+        parts = raw.split("/", 2)
+        if len(parts) < 2:
+            sys.exit(f"[!] --search-path needs at least \\\\host\\share: {args.search_path!r}")
+        host, share = parts[0], parts[1]
+        start_path = "\\" + parts[2].replace("/", "\\") if len(parts) == 3 else ""
+        found = search_path_for_wims(host, share, start_path, username,
+                                     args.password, domain, args.nthash)
+        if not found:
+            sys.exit("[!] No .wim files found under the given share/path.")
+
+        processed = set()
+        while True:
+            selected_uncs = prompt_wim_selection(host, found, processed)
+            if not selected_uncs:
+                print("[*] Exiting.")
+                return
+
+            for i, selected_unc in enumerate(selected_uncs, 1):
+                print(f"\n[*] Processing {i}/{len(selected_uncs)}: {selected_unc}")
+                image_out_dir = tempfile.mkdtemp(prefix="wim_dump_", dir=out_dir)
+                process_wim(selected_unc, no_download=False,
+                           username=username, password=args.password,
+                           domain=domain, nthash=args.nthash,
+                           image_index=args.image_index,
+                           out_dir=image_out_dir, wimlib=wimlib)
+                processed.add(selected_unc)
+        return
+
+    # ── single-file mode (no --search / --search-path) ──
     process_wim(args.wim_unc, no_download=args.no_download,
                username=username, password=args.password,
                domain=domain, nthash=args.nthash,
